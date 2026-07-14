@@ -415,8 +415,24 @@ func TestRenderJPEG(t *testing.T) {
 		t.Fatalf("not a valid JPEG: %v", err)
 	}
 	b := img.Bounds()
-	if b.Dx() < 500 || b.Dy() < 500 {
+	if b.Dx() < 1600 || b.Dy() < 1600 {
 		t.Errorf("image too small for print: %dx%d", b.Dx(), b.Dy())
+	}
+}
+
+func TestQRSizeOnCanvas(t *testing.T) {
+	url := "https://dkip-site.lolipop-now.app/?d=example.com&n=9f3a1c&sig=" + strings.Repeat("A", 86) + "&t=2026-07-14&y=2026"
+	modules, err := qrModules(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	px := qrPixelSize(len(modules), 2000)
+	// スキャン可能性のため、QR はキャンバス幅の 25% 以上を占めること
+	if px < 2000*25/100 {
+		t.Errorf("QR too small: %dpx on 2000px canvas (< 25%%)", px)
+	}
+	if px > 2000*40/100 {
+		t.Errorf("QR too large: %dpx on 2000px canvas (> 40%%)", px)
 	}
 }
 

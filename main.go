@@ -353,14 +353,23 @@ func qrImage(modules [][]bool) *image.RGBA {
 	return img
 }
 
+// qrPixelSize は QR の描画ピクセルサイズを返す。キャンバス幅の 3 割を目標に整数倍率で拡大する。
+func qrPixelSize(modules, canvasSize int) int {
+	scale := canvasSize * 3 / 10 / modules
+	if scale < 2 {
+		scale = 2
+	}
+	return modules * scale
+}
+
 // renderJPEG はドメイン名（＋ since <year>）と検証 URL の QR コードを描いた JPEG を生成し、
 // base64 データ URI で返す。qrURL が空なら QR は描かない。
 func renderJPEG(domain, year, qrURL string) (string, error) {
-	const size = 1200
+	const size = 2000
 	canvas := image.NewRGBA(image.Rect(0, 0, size, size))
 	draw.Draw(canvas, canvas.Bounds(), image.White, image.Point{}, draw.Src)
 
-	// ドメイン名: キャンバス幅の約 8 割に収まる整数倍率で拡大し、やや上寄りの中央に描く
+	// ドメイン名: キャンバス幅の約 8 割に収まる整数倍率で拡大し、上寄りの中央に描く
 	main := renderText(domain)
 	scale := size * 8 / 10 / main.Bounds().Dx()
 	if scale < 1 {
@@ -368,7 +377,7 @@ func renderJPEG(domain, year, qrURL string) (string, error) {
 	}
 	mainW := main.Bounds().Dx() * scale
 	mainH := main.Bounds().Dy() * scale
-	mainY := size*2/5 - mainH/2
+	mainY := size*3/10 - mainH/2
 	pasteScaled(canvas, main, (size-mainW)/2, mainY, scale)
 
 	bottom := mainY + mainH
@@ -389,17 +398,13 @@ func renderJPEG(domain, year, qrURL string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// スキャン可能な大きさ（240px 前後）になる整数倍率で拡大して下部中央に置く
-		qrScale := 240 / len(modules)
-		if qrScale < 2 {
-			qrScale = 2
+		// キャンバス幅の約 3 割の大きさで下部中央に置く。文字と重なる場合は重ならない倍率まで縮める
+		qrScale := qrPixelSize(len(modules), size) / len(modules)
+		for qrScale > 2 && size-len(modules)*qrScale-80 < bottom+60 {
+			qrScale--
 		}
 		qrPx := len(modules) * qrScale
-		qrY := size - qrPx - 60
-		if qrY < bottom+40 {
-			qrY = bottom + 40
-		}
-		pasteScaled(canvas, qrImage(modules), (size-qrPx)/2, qrY, qrScale)
+		pasteScaled(canvas, qrImage(modules), (size-qrPx)/2, size-qrPx-80, qrScale)
 	}
 
 	var buf bytes.Buffer
