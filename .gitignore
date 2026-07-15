@@ -30,6 +30,9 @@ go.work.sum
 # generated private key
 dns-signed-tee.key
 
+# built binary (module name)
+/dkip
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -8,7 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"image"
+	"image/color"
 	"image/jpeg"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -361,8 +364,13 @@ func TestCreateTee(t *testing.T) {
 		Texture  string `json:"texture"`
 		Title    string `json:"title"`
 		Products []struct {
-			ItemID    int  `json:"itemId"`
-			Published bool `json:"published"`
+			ItemID       int  `json:"itemId"`
+			Published    bool `json:"published"`
+			SubMaterials []struct {
+				Texture   string `json:"texture"`
+				PrintSide string `json:"printSide"`
+				Enabled   bool   `json:"enabled"`
+			} `json:"sub_materials"`
 		} `json:"products"`
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -379,7 +387,7 @@ func TestCreateTee(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	u, err := createTee(srv.Client(), srv.URL, "key", "data:image/jpeg;base64,xxx", "example.com")
+	u, err := createTee(srv.Client(), srv.URL, "key", "data:image/jpeg;base64,xxx", "example.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,13 +400,17 @@ func TestCreateTee(t *testing.T) {
 	if len(body.Products) != 1 || body.Products[0].ItemID != 1 || !body.Products[0].Published {
 		t.Errorf("products = %+v", body.Products)
 	}
+	// 背面なしのときは sub_materials を付けない
+	if len(body.Products[0].SubMaterials) != 0 {
+		t.Errorf("sub_materials should be empty when no back texture: %+v", body.Products[0].SubMaterials)
+	}
 }
 
 // --- renderJPEG ---
 
 func TestRenderJPEG(t *testing.T) {
 	uri, err := renderJPEG("example.com", "2014",
-		"https://dkip-site.lolipop-now.app/?d=example.com&n=9f3a1c&sig=xxx&t=2026-07-14&y=2014")
+		"https://dkip-site.lolipop-now.app/?d=example.com&n=9f3a1c&sig=xxx&t=2026-07-14&y=2014", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,5 +680,341 @@ func TestLoadConfigDomainFromArg(t *testing.T) {
 	}
 	if cfg.Domain != "" {
 		t.Errorf("DOMAIN env must be ignored, got %q", cfg.Domain)
+	}
+}
+
+// --- サイトロゴの取得 ---
+
+// pngBytes は指定サイズの単色 PNG バイト列を返す（テスト用のダミー画像）。
+func pngBytes(t *testing.T, w, h int, c color.Color) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestExtractLogoCandidatesPriority(t *testing.T) {
+	base, _ := url.Parse("https://example.com/")
+	htmlBody := `<html><head>
+		<link rel="icon" href="/favicon-16.png">
+		<meta property="og:image" content="https://cdn.example.com/og.png">
+		<link rel="apple-touch-icon" href="/apple.png">
+		<link rel="shortcut icon" href="/legacy.ico">
+		<link rel="icon" href="/logo.svg">
+	</head><body></body></html>`
+	cands := extractLogoCandidates(base, strings.NewReader(htmlBody))
+	sortByPriority(cands)
+
+	if len(cands) == 0 {
+		t.Fatal("no candidates extracted")
+	}
+	// SVG は除外される
+	for _, c := range cands {
+		if strings.HasSuffix(c.url, ".svg") {
+			t.Errorf("SVG candidate must be excluded: %s", c.url)
+		}
+	}
+	// 先頭は apple-touch-icon（絶対 URL に解決されている）
+	if cands[0].url != "https://example.com/apple.png" {
+		t.Errorf("top candidate = %q, want apple-touch-icon", cands[0].url)
+	}
+	// og:image が次点で、絶対 URL のまま保持される
+	if cands[1].url != "https://cdn.example.com/og.png" {
+		t.Errorf("second candidate = %q, want og:image", cands[1].url)
+	}
+}
+
+func TestFetchSiteLogoPrefersAppleTouchIcon(t *testing.T) {
+	apple := pngBytes(t, 180, 180, color.RGBA{R: 255, A: 255})
+	fav := pngBytes(t, 16, 16, color.RGBA{B: 255, A: 255})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<html><head>
+				<link rel="apple-touch-icon" href="/apple.png">
+			</head></html>`))
+		case "/apple.png":
+			w.Write(apple)
+		case "/favicon.ico":
+			w.Write(fav)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	logo, err := fetchSiteLogoAt(srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logo == nil {
+		t.Fatal("expected a logo, got nil")
+	}
+	if b := logo.Bounds(); b.Dx() != 180 || b.Dy() != 180 {
+		t.Errorf("logo size = %dx%d, want 180x180 (apple-touch-icon)", b.Dx(), b.Dy())
+	}
+}
+
+func TestFetchSiteLogoFallsBackToFavicon(t *testing.T) {
+	fav := pngBytes(t, 32, 32, color.RGBA{G: 255, A: 255})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<html><head><title>no icons here</title></head></html>`))
+		case "/favicon.ico":
+			w.Write(fav)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	logo, err := fetchSiteLogoAt(srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logo == nil {
+		t.Fatal("expected favicon fallback, got nil")
+	}
+	if b := logo.Bounds(); b.Dx() != 32 || b.Dy() != 32 {
+		t.Errorf("logo size = %dx%d, want 32x32 (favicon)", b.Dx(), b.Dy())
+	}
+}
+
+func TestFetchSiteLogoNoneReturnsNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Write([]byte(`<html><head></head></html>`))
+		default:
+			http.NotFound(w, r) // favicon.ico も無い
+		}
+	}))
+	defer srv.Close()
+
+	logo, err := fetchSiteLogoAt(srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logo != nil {
+		t.Errorf("expected nil logo when nothing is set, got %v", logo.Bounds())
+	}
+}
+
+func TestRenderJPEGWithLogo(t *testing.T) {
+	logo := image.NewRGBA(image.Rect(0, 0, 200, 200))
+	for y := 0; y < 200; y++ {
+		for x := 0; x < 200; x++ {
+			logo.Set(x, y, color.RGBA{R: 255, A: 255})
+		}
+	}
+	uri, err := renderJPEG("example.com", "2014",
+		"https://dkip-site.lolipop-now.app/?d=example.com&n=9f3a1c&sig=xxx&t=2026-07-14&y=2014", logo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const prefix = "data:image/jpeg;base64,"
+	raw, err := base64.StdEncoding.DecodeString(uri[len(prefix):])
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("not a valid JPEG: %v", err)
+	}
+	// ロゴは上部中央（約 5% の位置）に赤で描かれているはず
+	const size = 2000
+	c := img.At(size/2, size/20+50)
+	r, _, _, _ := c.RGBA()
+	if r>>8 < 200 {
+		t.Errorf("expected red logo near top-center, got %v", c)
+	}
+}
+
+// --- createTee 背面プリント ---
+
+func TestCreateTeeWithBack(t *testing.T) {
+	var body struct {
+		Products []struct {
+			ItemID       int `json:"itemId"`
+			SubMaterials []struct {
+				Texture   string `json:"texture"`
+				PrintSide string `json:"printSide"`
+				Enabled   bool   `json:"enabled"`
+			} `json:"sub_materials"`
+		} `json:"products"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		w.Write([]byte(`{"products":[{"sampleUrl":"https://suzuri.jp/x/1/t-shirt"}]}`))
+	}))
+	defer srv.Close()
+
+	_, err := createTee(srv.Client(), srv.URL, "key",
+		"data:image/jpeg;base64,front", "example.com", "data:image/jpeg;base64,back")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Products) != 1 || len(body.Products[0].SubMaterials) != 1 {
+		t.Fatalf("expected one sub_material, got %+v", body.Products)
+	}
+	sm := body.Products[0].SubMaterials[0]
+	if sm.Texture != "data:image/jpeg;base64,back" {
+		t.Errorf("back texture = %q", sm.Texture)
+	}
+	if sm.PrintSide != "back" || !sm.Enabled {
+		t.Errorf("printSide/enabled = %q/%v", sm.PrintSide, sm.Enabled)
+	}
+}
+
+// --- サイトマップの取得 ---
+
+func TestParseSitemapUrlset(t *testing.T) {
+	xmlBody := `<?xml version="1.0"?>
+	<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+		<url><loc>https://example.com/</loc></url>
+		<url><loc>https://example.com/about</loc></url>
+		<url><loc>https://example.com/blog/hello</loc></url>
+	</urlset>`
+	locs, children := parseSitemap(strings.NewReader(xmlBody))
+	if len(children) != 0 {
+		t.Errorf("urlset should have no child sitemaps, got %v", children)
+	}
+	if len(locs) != 3 || locs[1] != "https://example.com/about" {
+		t.Errorf("locs = %v", locs)
+	}
+}
+
+func TestParseSitemapIndex(t *testing.T) {
+	xmlBody := `<?xml version="1.0"?>
+	<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+		<sitemap><loc>https://example.com/sitemap-1.xml</loc></sitemap>
+		<sitemap><loc>https://example.com/sitemap-2.xml</loc></sitemap>
+	</sitemapindex>`
+	locs, children := parseSitemap(strings.NewReader(xmlBody))
+	if len(locs) != 0 {
+		t.Errorf("index should yield no direct locs, got %v", locs)
+	}
+	if len(children) != 2 || children[0] != "https://example.com/sitemap-1.xml" {
+		t.Errorf("children = %v", children)
+	}
+}
+
+func TestFetchSitemapURLsUrlset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sitemap.xml" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		w.Write([]byte(`<urlset><url><loc>https://example.com/a</loc></url>
+			<url><loc>https://example.com/b</loc></url></urlset>`))
+	}))
+	defer srv.Close()
+
+	urls := fetchSitemapURLsAt(srv.Client(), srv.URL+"/sitemap.xml")
+	if len(urls) != 2 || urls[0] != "https://example.com/a" {
+		t.Errorf("urls = %v", urls)
+	}
+}
+
+func TestFetchSitemapURLsIndexFollowsChildren(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sitemap.xml":
+			w.Write([]byte(`<sitemapindex><sitemap><loc>http://` + r.Host + `/child.xml</loc></sitemap></sitemapindex>`))
+		case "/child.xml":
+			w.Write([]byte(`<urlset><url><loc>https://example.com/deep</loc></url></urlset>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	urls := fetchSitemapURLsAt(srv.Client(), srv.URL+"/sitemap.xml")
+	if len(urls) != 1 || urls[0] != "https://example.com/deep" {
+		t.Errorf("expected to follow child sitemap, got %v", urls)
+	}
+}
+
+func TestFetchSitemapURLsNone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	if urls := fetchSitemapURLsAt(srv.Client(), srv.URL+"/sitemap.xml"); urls != nil {
+		t.Errorf("expected nil when no sitemap, got %v", urls)
+	}
+}
+
+func TestSitemapPaths(t *testing.T) {
+	in := []string{"https://example.com/", "https://example.com/about", "https://example.com/s?q=1"}
+	got := sitemapPaths(in)
+	want := []string{"/", "/about", "/s?q=1"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("paths[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestLimitSitemapURLs(t *testing.T) {
+	many := make([]string, maxSitemapURLs+10)
+	for i := range many {
+		many[i] = "https://example.com/p"
+	}
+	shown, total := limitSitemapURLs(many)
+	if len(shown) != maxSitemapURLs {
+		t.Errorf("shown = %d, want %d", len(shown), maxSitemapURLs)
+	}
+	if total != maxSitemapURLs+10 {
+		t.Errorf("total = %d, want %d", total, maxSitemapURLs+10)
+	}
+
+	few := []string{"https://example.com/a"}
+	shown, total = limitSitemapURLs(few)
+	if len(shown) != 1 || total != 1 {
+		t.Errorf("small set: shown=%d total=%d", len(shown), total)
+	}
+}
+
+func TestRenderSitemapJPEG(t *testing.T) {
+	// 空なら背面なし
+	uri, err := renderSitemapJPEG("example.com", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uri != "" {
+		t.Errorf("empty paths should yield no image, got %.30q", uri)
+	}
+
+	paths := []string{"/", "/about", "/blog/hello", "/contact"}
+	uri, err = renderSitemapJPEG("example.com", paths, 120) // total>len → "+N more"
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(uri[len("data:image/jpeg;base64,"):])
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("not a valid JPEG: %v", err)
+	}
+	if b := img.Bounds(); b.Dx() < 1600 || b.Dy() < 1600 {
+		t.Errorf("back image too small: %dx%d", b.Dx(), b.Dy())
 	}
 }
