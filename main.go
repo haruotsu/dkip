@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -18,7 +19,7 @@ import (
 	"image/draw"
 	_ "image/gif"
 	"image/jpeg"
-	_ "image/png"
+	"image/png"
 	"io"
 	"net/http"
 	"net/url"
@@ -28,6 +29,9 @@ import (
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
+	"github.com/srwiley/oksvg"
+	"github.com/srwiley/rasterx"
+	"golang.org/x/image/bmp"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
@@ -387,7 +391,6 @@ const (
 )
 
 // extractLogoCandidates は HTML から候補 URL を抽出し、base で絶対 URL に解決して優先度順に返す。
-// SVG は image.Decode で扱えないため除外する。
 func extractLogoCandidates(base *url.URL, htmlBody io.Reader) []logoCandidate {
 	root, err := html.Parse(htmlBody)
 	if err != nil {
@@ -406,9 +409,6 @@ func extractLogoCandidates(base *url.URL, htmlBody io.Reader) []logoCandidate {
 		abs := base.ResolveReference(ref)
 		if abs.Scheme != "http" && abs.Scheme != "https" {
 			return
-		}
-		if strings.HasSuffix(strings.ToLower(abs.Path), ".svg") {
-			return // SVG は image.Decode 非対応
 		}
 		cands = append(cands, logoCandidate{url: abs.String(), priority: prio})
 	}
@@ -454,6 +454,7 @@ func attr(n *html.Node, key string) string {
 }
 
 // downloadImage は URL から画像を取得してデコードする。
+// ラスタ画像（PNG/JPEG/GIF）を優先し、扱えなければ SVG としてのラスタライズを試す。
 func downloadImage(hc *http.Client, u string) (image.Image, error) {
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
@@ -468,8 +469,120 @@ func downloadImage(hc *http.Client, u string) (image.Image, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	img, _, err := image.Decode(io.LimitReader(resp.Body, 10<<20)) // 上限 10MB
-	return img, err
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 上限 10MB
+	if err != nil {
+		return nil, err
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err == nil {
+		return img, nil
+	}
+	if img, icoErr := decodeICO(data); icoErr == nil {
+		return img, nil
+	}
+	return rasterizeSVG(data)
+}
+
+// decodeICO は ICO コンテナから最大サイズのエントリを取り出してデコードする。
+// エントリは PNG か、BITMAPFILEHEADER を持たない BMP (DIB) のどちらか。
+func decodeICO(data []byte) (image.Image, error) {
+	// ICONDIR: reserved=0, type=1 (icon), count
+	if len(data) < 6 || data[0] != 0 || data[1] != 0 || data[2] != 1 || data[3] != 0 {
+		return nil, errors.New("ICO 形式ではない")
+	}
+	count := int(binary.LittleEndian.Uint16(data[4:6]))
+	bestW := -1
+	var entry []byte
+	for i := 0; i < count; i++ {
+		off := 6 + 16*i
+		if off+16 > len(data) {
+			break
+		}
+		w := int(data[off])
+		if w == 0 {
+			w = 256 // 幅 0 は 256px の意味
+		}
+		size := int(binary.LittleEndian.Uint32(data[off+8:]))
+		dataOff := int(binary.LittleEndian.Uint32(data[off+12:]))
+		if dataOff < 0 || size <= 0 || dataOff+size > len(data) {
+			continue
+		}
+		if w > bestW {
+			bestW = w
+			entry = data[dataOff : dataOff+size]
+		}
+	}
+	if entry == nil {
+		return nil, errors.New("ICO に有効なエントリが無い")
+	}
+	if bytes.HasPrefix(entry, []byte("\x89PNG\r\n\x1a\n")) {
+		return png.Decode(bytes.NewReader(entry))
+	}
+	return decodeICODIB(entry)
+}
+
+// decodeICODIB は ICO 内の DIB に BITMAPFILEHEADER を補って BMP としてデコードする。
+// DIB の高さは AND マスク分を含めて実寸の 2 倍で記録されているため半分に戻す。
+func decodeICODIB(dib []byte) (image.Image, error) {
+	const fileHeaderSize = 14
+	if len(dib) < 40 {
+		return nil, errors.New("DIB が短すぎる")
+	}
+	hdrSize := binary.LittleEndian.Uint32(dib[0:4])
+	if hdrSize != 40 {
+		return nil, fmt.Errorf("未対応の DIB ヘッダサイズ: %d", hdrSize)
+	}
+	fixed := make([]byte, len(dib))
+	copy(fixed, dib)
+	height := int32(binary.LittleEndian.Uint32(dib[8:12]))
+	binary.LittleEndian.PutUint32(fixed[8:12], uint32(height/2))
+
+	bpp := binary.LittleEndian.Uint16(dib[14:16])
+	colors := binary.LittleEndian.Uint32(dib[32:36])
+	if colors == 0 && bpp <= 8 {
+		colors = 1 << bpp
+	}
+	var buf bytes.Buffer
+	buf.WriteString("BM")
+	binary.Write(&buf, binary.LittleEndian, uint32(fileHeaderSize+len(fixed)))
+	binary.Write(&buf, binary.LittleEndian, uint32(0)) // reserved
+	binary.Write(&buf, binary.LittleEndian, fileHeaderSize+hdrSize+colors*4)
+	buf.Write(fixed)
+	return bmp.Decode(&buf)
+}
+
+// svgRasterSize は SVG をラスタライズするときの長辺ピクセル数。
+// Tシャツ印刷用キャンバスに 25% 幅で載せても粗くならない大きさにしている。
+const svgRasterSize = 512
+
+// rasterizeSVG は SVG バイト列を長辺 svgRasterSize px、アスペクト比維持でラスタライズする。
+func rasterizeSVG(data []byte) (img image.Image, err error) {
+	// oksvg は不正な入力で panic することがあるため、外部サイト由来の
+	// データを渡す以上ここで回収してエラーに変換する
+	defer func() {
+		if r := recover(); r != nil {
+			img, err = nil, fmt.Errorf("SVG のラスタライズに失敗: %v", r)
+		}
+	}()
+	icon, err := oksvg.ReadIconStream(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	vw, vh := icon.ViewBox.W, icon.ViewBox.H
+	if vw <= 0 || vh <= 0 {
+		vw, vh = 1, 1 // viewBox が無い/不正なら正方形として扱う
+	}
+	scale := svgRasterSize / vw
+	if vh > vw {
+		scale = svgRasterSize / vh
+	}
+	w := int(vw*scale + 0.5)
+	h := int(vh*scale + 0.5)
+	icon.SetTarget(0, 0, float64(w), float64(h))
+	rgba := image.NewRGBA(image.Rect(0, 0, w, h))
+	scanner := rasterx.NewScannerGV(w, h, rgba, rgba.Bounds())
+	icon.Draw(rasterx.NewDasher(w, h, scanner), 1.0)
+	return rgba, nil
 }
 
 // fetchSiteLogo は対象ドメインの Web サイトから icon/logo を取得してデコード済み画像を返す。

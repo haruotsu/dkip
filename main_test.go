@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -716,11 +717,15 @@ func TestExtractLogoCandidatesPriority(t *testing.T) {
 	if len(cands) == 0 {
 		t.Fatal("no candidates extracted")
 	}
-	// SVG は除外される
+	// SVG も候補に残る（ダウンロード時にラスタライズする）
+	hasSVG := false
 	for _, c := range cands {
 		if strings.HasSuffix(c.url, ".svg") {
-			t.Errorf("SVG candidate must be excluded: %s", c.url)
+			hasSVG = true
 		}
+	}
+	if !hasSVG {
+		t.Error("SVG candidate must be kept (rasterized at download time)")
 	}
 	// 先頭は apple-touch-icon（絶対 URL に解決されている）
 	if cands[0].url != "https://example.com/apple.png" {
@@ -808,6 +813,189 @@ func TestFetchSiteLogoNoneReturnsNil(t *testing.T) {
 	}
 	if logo != nil {
 		t.Errorf("expected nil logo when nothing is set, got %v", logo.Bounds())
+	}
+}
+
+func TestFetchSiteLogoRasterizesSVGIcon(t *testing.T) {
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#ff0000"/></svg>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<html><head>
+				<link rel="icon" href="/icon.svg?v=abc123" sizes="any" type="image/svg+xml">
+			</head></html>`))
+		case "/icon.svg":
+			w.Header().Set("Content-Type", "image/svg+xml")
+			w.Write([]byte(svg))
+		default:
+			http.NotFound(w, r) // /favicon.ico も無い
+		}
+	}))
+	defer srv.Close()
+
+	logo, err := fetchSiteLogoAt(srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logo == nil {
+		t.Fatal("expected rasterized SVG logo, got nil")
+	}
+	b := logo.Bounds()
+	if b.Dx() != b.Dy() {
+		t.Errorf("logo aspect = %dx%d, want square (viewBox 100x100)", b.Dx(), b.Dy())
+	}
+	if b.Dx() < 100 {
+		t.Errorf("logo width = %d, want >= 100 (rasterized at print-friendly size)", b.Dx())
+	}
+	// 中央付近が塗りの赤であること（ラスタライズが実際に描画している）
+	r, g, _, a := logo.At(b.Dx()/2, b.Dy()/2).RGBA()
+	if a == 0 || r < 0x8000 || g > 0x4000 {
+		t.Errorf("center pixel = r:%#x g:%#x a:%#x, want opaque red", r, g, a)
+	}
+}
+
+// icoBytes は 1 枚の PNG を埋め込んだ ICO ファイルを組み立てる。
+func icoBytes(t *testing.T, w, h int, c color.Color) []byte {
+	t.Helper()
+	pngData := pngBytes(t, w, h, c)
+	var buf bytes.Buffer
+	// ICONDIR: reserved, type=1 (icon), count=1
+	binary.Write(&buf, binary.LittleEndian, [3]uint16{0, 1, 1})
+	// ICONDIRENTRY
+	buf.WriteByte(byte(w))                                        // width
+	buf.WriteByte(byte(h))                                        // height
+	buf.WriteByte(0)                                              // palette colors
+	buf.WriteByte(0)                                              // reserved
+	binary.Write(&buf, binary.LittleEndian, uint16(1))            // planes
+	binary.Write(&buf, binary.LittleEndian, uint16(32))           // bit count
+	binary.Write(&buf, binary.LittleEndian, uint32(len(pngData))) // data size
+	binary.Write(&buf, binary.LittleEndian, uint32(22))           // data offset (6+16)
+	buf.Write(pngData)
+	return buf.Bytes()
+}
+
+// icoBMPBytes は 24bpp の BMP (DIB) を 1 枚埋め込んだクラシックな ICO を組み立てる。
+// DIB の高さは AND マスク分を含む 2 倍で記録する（ICO の仕様どおり）。
+func icoBMPBytes(t *testing.T, w, h int, c color.RGBA) []byte {
+	t.Helper()
+	rowSize := (w*3 + 3) &^ 3     // 24bpp 行は 4 バイト境界に揃える
+	maskRow := ((w+7)/8 + 3) &^ 3 // AND マスク行も 4 バイト境界
+	var dib bytes.Buffer
+	binary.Write(&dib, binary.LittleEndian, uint32(40))   // ヘッダサイズ
+	binary.Write(&dib, binary.LittleEndian, int32(w))     // 幅
+	binary.Write(&dib, binary.LittleEndian, int32(h*2))   // 高さ（マスク込みで 2 倍）
+	binary.Write(&dib, binary.LittleEndian, uint16(1))    // planes
+	binary.Write(&dib, binary.LittleEndian, uint16(24))   // bpp
+	binary.Write(&dib, binary.LittleEndian, [6]uint32{0}) // 圧縮以降は全て 0
+	for y := 0; y < h; y++ {                              // ピクセル（ボトムアップ、BGR）
+		row := make([]byte, rowSize)
+		for x := 0; x < w; x++ {
+			row[x*3], row[x*3+1], row[x*3+2] = c.B, c.G, c.R
+		}
+		dib.Write(row)
+	}
+	dib.Write(make([]byte, maskRow*h)) // AND マスク（全ピクセル不透明）
+
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, [3]uint16{0, 1, 1}) // ICONDIR
+	buf.WriteByte(byte(w))
+	buf.WriteByte(byte(h))
+	buf.WriteByte(0)                                           // palette colors
+	buf.WriteByte(0)                                           // reserved
+	binary.Write(&buf, binary.LittleEndian, uint16(1))         // planes
+	binary.Write(&buf, binary.LittleEndian, uint16(24))        // bit count
+	binary.Write(&buf, binary.LittleEndian, uint32(dib.Len())) // data size
+	binary.Write(&buf, binary.LittleEndian, uint32(22))        // data offset
+	buf.Write(dib.Bytes())
+	return buf.Bytes()
+}
+
+func TestDecodeICOClassicBMP(t *testing.T) {
+	data := icoBMPBytes(t, 32, 32, color.RGBA{R: 255, A: 255})
+	img, err := decodeICO(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := img.Bounds(); b.Dx() != 32 || b.Dy() != 32 {
+		t.Errorf("size = %dx%d, want 32x32", b.Dx(), b.Dy())
+	}
+	r, g, _, _ := img.At(16, 16).RGBA()
+	if r < 0x8000 || g > 0x4000 {
+		t.Errorf("center pixel = r:%#x g:%#x, want red", r, g)
+	}
+}
+
+func TestDecodeICORejectsGarbage(t *testing.T) {
+	if _, err := decodeICO([]byte("not an ico at all")); err == nil {
+		t.Error("expected error for non-ICO data")
+	}
+	if _, err := decodeICO([]byte{0, 0, 1, 0, 9, 0}); err == nil {
+		t.Error("expected error for truncated ICO directory")
+	}
+}
+
+func TestFetchSiteLogoDecodesICOFavicon(t *testing.T) {
+	fav := icoBytes(t, 48, 48, color.RGBA{G: 255, A: 255})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<html><head><title>no icons in html</title></head></html>`))
+		case "/favicon.ico":
+			w.Header().Set("Content-Type", "image/x-icon")
+			w.Write(fav)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	logo, err := fetchSiteLogoAt(srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logo == nil {
+		t.Fatal("expected ICO favicon to decode, got nil")
+	}
+	if b := logo.Bounds(); b.Dx() != 48 || b.Dy() != 48 {
+		t.Errorf("logo size = %dx%d, want 48x48", b.Dx(), b.Dy())
+	}
+}
+
+func TestFetchSiteLogoBrokenSVGReturnsNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<html><head><link rel="icon" href="/icon.svg"></head></html>`))
+		case "/icon.svg":
+			w.Header().Set("Content-Type", "image/svg+xml")
+			w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0`)) // 途中で切れた SVG
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	logo, err := fetchSiteLogoAt(srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logo != nil {
+		t.Errorf("expected nil logo for broken SVG, got %v", logo.Bounds())
+	}
+}
+
+func TestRasterizeSVGKeepsAspectRatio(t *testing.T) {
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><rect width="200" height="100" fill="#00f"/></svg>`
+	img, err := rasterizeSVG([]byte(svg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := img.Bounds()
+	if b.Dx() != 512 || b.Dy() != 256 {
+		t.Errorf("rasterized size = %dx%d, want 512x256 (long side 512, aspect 2:1)", b.Dx(), b.Dy())
 	}
 }
 
