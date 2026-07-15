@@ -1,4 +1,4 @@
-# dkip
+# DKIP (DomainKeys Identified Product)
 
 自分のドメインを、DNS が保証してくれる T シャツにする発行 CLI。
 
