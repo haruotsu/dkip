@@ -10,12 +10,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
+	_ "image/gif"
 	"image/jpeg"
+	_ "image/png"
 	"io"
 	"net/http"
 	"net/url"
@@ -25,9 +28,11 @@ import (
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
+	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
+	"golang.org/x/net/html"
 )
 
 const keyFilePath = "dns-signed-tee.key"
@@ -331,13 +336,18 @@ func ensureTXT(hc *http.Client, base, token, domainID, name, value string) (crea
 // ---- SUZURI API ----
 
 // createTee は JPEG データ URI を素材として T シャツを生成し、商品ページ URL を返す。
-func createTee(hc *http.Client, base, token, dataURI, title string) (string, error) {
+// backDataURI が空でなければ背面プリント（printSide: back）として追加する。
+func createTee(hc *http.Client, base, token, dataURI, title, backDataURI string) (string, error) {
+	product := map[string]any{"itemId": 1, "published": true} // itemId 1 = スタンダード T シャツ
+	if backDataURI != "" {
+		product["sub_materials"] = []map[string]any{
+			{"texture": backDataURI, "printSide": "back", "enabled": true},
+		}
+	}
 	reqBody := map[string]any{
-		"texture": dataURI,
-		"title":   title,
-		"products": []map[string]any{
-			{"itemId": 1, "published": true}, // itemId 1 = スタンダード T シャツ
-		},
+		"texture":  dataURI,
+		"title":    title,
+		"products": []map[string]any{product},
 	}
 	status, body, err := doJSON(hc, http.MethodPost, base+"/api/v1/materials", token, reqBody)
 	if err != nil {
@@ -358,6 +368,298 @@ func createTee(hc *http.Client, base, token, dataURI, title string) (string, err
 		return "", nil
 	}
 	return res.Products[0].SampleURL, nil
+}
+
+// ---- サイトロゴの取得 ----
+
+// logoCandidate は抽出したロゴ/アイコン候補。priority が小さいほど優先（高解像度寄り）。
+type logoCandidate struct {
+	url      string
+	priority int
+}
+
+// 優先度: apple-touch-icon(0) → og:image(1) → rel=icon(2) → /favicon.ico(3)。小さいほど優先。
+const (
+	prioAppleTouch = 0
+	prioOGImage    = 1
+	prioIcon       = 2
+	prioFavicon    = 3
+)
+
+// extractLogoCandidates は HTML から候補 URL を抽出し、base で絶対 URL に解決して優先度順に返す。
+// SVG は image.Decode で扱えないため除外する。
+func extractLogoCandidates(base *url.URL, htmlBody io.Reader) []logoCandidate {
+	root, err := html.Parse(htmlBody)
+	if err != nil {
+		return nil
+	}
+	var cands []logoCandidate
+	add := func(raw string, prio int) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		ref, err := url.Parse(raw)
+		if err != nil {
+			return
+		}
+		abs := base.ResolveReference(ref)
+		if abs.Scheme != "http" && abs.Scheme != "https" {
+			return
+		}
+		if strings.HasSuffix(strings.ToLower(abs.Path), ".svg") {
+			return // SVG は image.Decode 非対応
+		}
+		cands = append(cands, logoCandidate{url: abs.String(), priority: prio})
+	}
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "link":
+				rel := strings.ToLower(attr(n, "rel"))
+				href := attr(n, "href")
+				switch {
+				case strings.Contains(rel, "apple-touch-icon"):
+					add(href, prioAppleTouch)
+				case strings.Contains(rel, "icon"): // "icon" / "shortcut icon"
+					add(href, prioIcon)
+				}
+			case "meta":
+				prop := strings.ToLower(attr(n, "property"))
+				if prop == "" {
+					prop = strings.ToLower(attr(n, "name"))
+				}
+				if prop == "og:image" || prop == "og:image:url" {
+					add(attr(n, "content"), prioOGImage)
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return cands
+}
+
+// attr はノードの属性値を（大文字小文字を無視して）返す。無ければ空文字。
+func attr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, key) {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+// downloadImage は URL から画像を取得してデコードする。
+func downloadImage(hc *http.Client, u string) (image.Image, error) {
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "dkip")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	img, _, err := image.Decode(io.LimitReader(resp.Body, 10<<20)) // 上限 10MB
+	return img, err
+}
+
+// fetchSiteLogo は対象ドメインの Web サイトから icon/logo を取得してデコード済み画像を返す。
+// https を優先し、失敗したら http も試す。見つからなければ (nil, nil) を返す（エラーではない）。
+func fetchSiteLogo(hc *http.Client, domain string) (image.Image, error) {
+	return fetchSiteLogoAt(hc, "https://"+domain+"/", "http://"+domain+"/")
+}
+
+// fetchSiteLogoAt は指定したトップページ URL 群を順に試して icon/logo を取得する。
+// 最初に到達できたページから候補を集める。見つからなければ (nil, nil) を返す。
+func fetchSiteLogoAt(hc *http.Client, pageURLs ...string) (image.Image, error) {
+	var cands []logoCandidate
+	var pageURL *url.URL
+	for _, u := range pageURLs {
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "dkip")
+		resp, err := hc.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		pageURL = resp.Request.URL // リダイレクト後の URL を基準にする
+		cands = extractLogoCandidates(pageURL, io.LimitReader(resp.Body, 5<<20))
+		resp.Body.Close()
+		break
+	}
+	if pageURL == nil {
+		return nil, nil // サイトに到達できなかった
+	}
+	// /favicon.ico を最後の候補として常に追加
+	fav := *pageURL
+	fav.Path = "/favicon.ico"
+	fav.RawQuery = ""
+	cands = append(cands, logoCandidate{url: fav.String(), priority: prioFavicon})
+
+	// 優先度順（安定ソート: 同順位は出現順を維持）に並べ、取得できた最初の 1 枚を使う
+	sortByPriority(cands)
+	seen := map[string]bool{}
+	for _, c := range cands {
+		if seen[c.url] {
+			continue
+		}
+		seen[c.url] = true
+		if img, err := downloadImage(hc, c.url); err == nil && img != nil {
+			return img, nil
+		}
+	}
+	return nil, nil
+}
+
+// sortByPriority は priority 昇順の安定ソート（挿入ソート）。候補数は少ないので十分。
+func sortByPriority(cs []logoCandidate) {
+	for i := 1; i < len(cs); i++ {
+		for j := i; j > 0 && cs[j].priority < cs[j-1].priority; j-- {
+			cs[j], cs[j-1] = cs[j-1], cs[j]
+		}
+	}
+}
+
+// ---- サイトマップの取得 ----
+
+// maxSitemapURLs は背面に載せる URL の上限。超過分は「+N more」で示す。
+const maxSitemapURLs = 60
+
+// parseSitemap は sitemap XML をパースし、<urlset> なら <loc> を、
+// <sitemapindex> なら子 sitemap の URL を返す（後者は fetchSitemapURLs 側で 1 階層だけ辿る）。
+func parseSitemap(r io.Reader) (locs []string, childSitemaps []string) {
+	dec := xml.NewDecoder(r)
+	var inSitemap bool // 現在 <sitemap>（index の子）要素の中か
+	var cur strings.Builder
+	var capturing bool
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "sitemap":
+				inSitemap = true
+			case "loc":
+				capturing = true
+				cur.Reset()
+			}
+		case xml.CharData:
+			if capturing {
+				cur.Write(t)
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "loc":
+				capturing = false
+				u := strings.TrimSpace(cur.String())
+				if u == "" {
+					break
+				}
+				if inSitemap {
+					childSitemaps = append(childSitemaps, u)
+				} else {
+					locs = append(locs, u)
+				}
+			case "sitemap":
+				inSitemap = false
+			}
+		}
+	}
+	return locs, childSitemaps
+}
+
+// fetchSitemapURLs は対象ドメインの /sitemap.xml から URL 一覧を取得する。
+// sitemapindex の場合は子 sitemap を 1 階層だけ辿る。取れなければ nil を返す（エラーではない）。
+func fetchSitemapURLs(hc *http.Client, domain string) []string {
+	return fetchSitemapURLsAt(hc, "https://"+domain+"/sitemap.xml", "http://"+domain+"/sitemap.xml")
+}
+
+// fetchSitemapURLsAt は指定した sitemap URL 群を順に試して URL 一覧を返す（全件。切り詰めは呼び出し側）。
+// テスト用に URL を差し替えられる。子 sitemap の辿りすぎを防ぐため過剰取得時点で打ち切る。
+func fetchSitemapURLsAt(hc *http.Client, sitemapURLs ...string) []string {
+	locs, children := fetchOneSitemap(hc, sitemapURLs...)
+	// sitemapindex だった場合、子 sitemap を 1 階層だけ辿って loc を集める
+	for _, child := range children {
+		if len(locs) >= maxSitemapURLs*4 { // 上限の数倍集まれば十分（「+N more」用の概数）
+			break
+		}
+		childLocs, _ := fetchOneSitemap(hc, child)
+		locs = append(locs, childLocs...)
+	}
+	if len(locs) == 0 {
+		return nil
+	}
+	return locs
+}
+
+// limitSitemapURLs は URL 一覧を上限まで切り詰め、切り詰め後の一覧と切り詰め前の総数を返す。
+func limitSitemapURLs(urls []string) (shown []string, total int) {
+	total = len(urls)
+	if total > maxSitemapURLs {
+		return urls[:maxSitemapURLs], total
+	}
+	return urls, total
+}
+
+// fetchOneSitemap は最初に到達できた URL の sitemap をパースして返す。
+func fetchOneSitemap(hc *http.Client, urls ...string) (locs []string, children []string) {
+	for _, u := range urls {
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "dkip")
+		resp, err := hc.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		l, c := parseSitemap(io.LimitReader(resp.Body, 10<<20))
+		resp.Body.Close()
+		return l, c
+	}
+	return nil, nil
+}
+
+// sitemapPaths は URL 一覧を背面表示用のパス（+クエリ）文字列に変換する。ホスト部は省く。
+func sitemapPaths(urls []string) []string {
+	paths := make([]string, 0, len(urls))
+	for _, raw := range urls {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		p := u.Path
+		if p == "" {
+			p = "/"
+		}
+		if u.RawQuery != "" {
+			p += "?" + u.RawQuery
+		}
+		paths = append(paths, p)
+	}
+	return paths
 }
 
 // ---- 画像化 ----
@@ -427,12 +729,34 @@ func qrPixelSize(modules, canvasSize int) int {
 	return modules * scale
 }
 
+// drawLogo は logo をキャンバス上部中央に、幅がキャンバスの約 25% になるよう縦横比維持で
+// 高品質縮小して描き、ロゴ下端の Y 座標を返す。logo が nil なら何もせず 0 を返す。
+func drawLogo(canvas *image.RGBA, logo image.Image, size int) int {
+	if logo == nil {
+		return 0
+	}
+	src := logo.Bounds()
+	if src.Dx() <= 0 || src.Dy() <= 0 {
+		return 0
+	}
+	targetW := size * 25 / 100
+	targetH := targetW * src.Dy() / src.Dx()
+	top := size / 20 // 上端から 5% の余白
+	x := (size - targetW) / 2
+	dst := image.Rect(x, top, x+targetW, top+targetH)
+	xdraw.CatmullRom.Scale(canvas, dst, logo, src, xdraw.Over, nil)
+	return top + targetH
+}
+
 // renderJPEG はドメイン名（＋ since <year>）と検証 URL の QR コードを描いた JPEG を生成し、
-// base64 データ URI で返す。qrURL が空なら QR は描かない。
-func renderJPEG(domain, year, qrURL string) (string, error) {
+// base64 データ URI で返す。qrURL が空なら QR は描かない。logo が非 nil なら上部中央に取り込む。
+func renderJPEG(domain, year, qrURL string, logo image.Image) (string, error) {
 	const size = 2000
 	canvas := image.NewRGBA(image.Rect(0, 0, size, size))
 	draw.Draw(canvas, canvas.Bounds(), image.White, image.Point{}, draw.Src)
+
+	// サイトロゴがあれば上部中央に描画し、その下端分だけ以降の要素を押し下げる
+	logoBottom := drawLogo(canvas, logo, size)
 
 	// ドメイン名: キャンバス幅の約 8 割に収まる整数倍率で拡大し、上寄りの中央に描く
 	main := renderText(domain)
@@ -443,6 +767,10 @@ func renderJPEG(domain, year, qrURL string) (string, error) {
 	mainW := main.Bounds().Dx() * scale
 	mainH := main.Bounds().Dy() * scale
 	mainY := size*3/10 - mainH/2
+	// ロゴと重なる場合はドメイン名をロゴの下へずらす
+	if logoBottom > 0 && mainY < logoBottom+size/40 {
+		mainY = logoBottom + size/40
+	}
 	pasteScaled(canvas, main, (size-mainW)/2, mainY, scale)
 
 	bottom := mainY + mainH
@@ -472,12 +800,116 @@ func renderJPEG(domain, year, qrURL string) (string, error) {
 		pasteScaled(canvas, qrImage(modules), (size-qrPx)/2, size-qrPx-80, qrScale)
 	}
 
+	return encodeJPEGDataURI(canvas)
+}
+
+// encodeJPEGDataURI は画像を高品質 JPEG にして base64 データ URI で返す。
+// 白背景に細い黒文字はモスキートノイズが出やすいので高品質でエンコードする。
+func encodeJPEGDataURI(img image.Image) (string, error) {
 	var buf bytes.Buffer
-	// 白背景に細い黒文字はモスキートノイズが出やすいので高品質でエンコードする
-	if err := jpeg.Encode(&buf, canvas, &jpeg.Options{Quality: 95}); err != nil {
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err != nil {
 		return "", err
 	}
 	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+// renderSitemapJPEG は背面用に、見出し（domain / sitemap）と URL パス一覧を縦に並べた
+// JPEG を生成して base64 データ URI で返す。paths が空なら ("", nil) を返す（背面なし）。
+// total は省略前の総件数で、paths より多ければ末尾に「+N more」を添える。
+func renderSitemapJPEG(domain string, paths []string, total int) (string, error) {
+	if len(paths) == 0 {
+		return "", nil
+	}
+	const size = 2000
+	canvas := image.NewRGBA(image.Rect(0, 0, size, size))
+	draw.Draw(canvas, canvas.Bounds(), image.White, image.Point{}, draw.Src)
+
+	// 見出し: domain（大きめ）→ sitemap（小さめ）を上部中央に
+	head := renderText(domain)
+	headScale := size * 6 / 10 / head.Bounds().Dx()
+	if headScale < 1 {
+		headScale = 1
+	}
+	headW := head.Bounds().Dx() * headScale
+	headH := head.Bounds().Dy() * headScale
+	pasteScaled(canvas, head, (size-headW)/2, size/20, headScale)
+
+	sub := renderText("sitemap")
+	subScale := headScale / 2
+	if subScale < 1 {
+		subScale = 1
+	}
+	subW := sub.Bounds().Dx() * subScale
+	subY := size/20 + headH + headH/4
+	pasteScaled(canvas, sub, (size-subW)/2, subY, subScale)
+	subBottom := subY + sub.Bounds().Dy()*subScale
+
+	// 表示行を確定（超過分は「+N more」を末尾に）
+	lines := paths
+	if extra := total - len(paths); extra > 0 {
+		lines = append(append([]string{}, paths...), fmt.Sprintf("+%d more", extra))
+	}
+
+	// リスト領域: 見出しの下〜下端。上下左右に余白 margin をとり、幅は約 85% まで使う
+	const margin = 120
+	listTop := subBottom + size/20
+	availH := size - listTop - margin
+	availW := size * 85 / 100
+
+	adv := basicfont.Face7x13.Advance // 1 文字の送り幅
+	glyphH := renderText("M").Bounds().Dy()
+
+	// 最長行がキャンバス幅の約 85% に収まる整数倍率を基準サイズにする（大きめ・上限あり）
+	maxLen := 1
+	for _, l := range lines {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	pathScale := availW / (maxLen * adv)
+	if pathScale > 14 {
+		pathScale = 14
+	}
+	// 縦に全行が入らなければ、入るまでサイズを下げる（行間はサイズの 1.4 倍）
+	for pathScale > 2 && len(lines)*glyphH*pathScale*14/10 > availH {
+		pathScale--
+	}
+	if pathScale < 2 {
+		pathScale = 2
+	}
+	lineH := glyphH * pathScale * 14 / 10
+
+	// 収まらない長さは末尾を ~ で省略（basicfont は ASCII のみ）
+	maxChars := availW / (adv * pathScale)
+
+	// ブロック全体を縦中央寄せ、左端はキャンバス中央（はみ出す場合は収まる位置まで左へ）
+	blockH := len(lines) * lineH
+	startY := listTop + (availH-blockH)/2
+	if startY < listTop {
+		startY = listTop
+	}
+	blockW := maxLen * adv * pathScale
+	if blockW > maxChars*adv*pathScale {
+		blockW = maxChars * adv * pathScale
+	}
+	// ブロック（最長行の幅）の中心をキャンバス中心に合わせる
+	blockX := (size - blockW) / 2
+	if blockX < margin {
+		blockX = margin
+	}
+
+	for i, line := range lines {
+		if maxChars > 1 && len(line) > maxChars {
+			line = line[:maxChars-1] + "~"
+		}
+		y := startY + i*lineH
+		if y+glyphH*pathScale > size-margin {
+			break
+		}
+		pasteScaled(canvas, renderText(line), blockX, y, pathScale)
+	}
+
+	return encodeJPEGDataURI(canvas)
 }
 
 // ---- 秘密鍵の保存 ----
@@ -636,13 +1068,42 @@ func main() {
 	}
 
 	step("👕", "T シャツを生成中...")
+	// 対象ドメインのサイトから icon/logo を取得できれば取り込む（失敗しても続行）
+	logo, err := fetchSiteLogo(hc, target.FQDN)
+	if err != nil {
+		logo = nil
+	}
+	if logo != nil {
+		detail("→ サイトのロゴを取り込みました")
+	} else {
+		detail("→ サイトのロゴは見つかりませんでした（ドメイン名だけで作ります）")
+	}
 	// QR には item なしの検証 URL を入れる（商品 URL は T シャツ生成後にしか分からないため）
 	qrURL := buildVerifyURL(cfg.VerifyBase, target.FQDN, year, issuedAt, nonce, sig, "")
-	dataURI, err := renderJPEG(target.FQDN, year, qrURL)
+	dataURI, err := renderJPEG(target.FQDN, year, qrURL, logo)
 	if err != nil {
 		fail("画像の生成に失敗しました", err)
 	}
-	teeURL, err := createTee(hc, cfg.SuzuriBase, cfg.SuzuriKey, dataURI, target.FQDN)
+
+	// 背面: sitemap.xml から URL 一覧を取得できれば背面プリントにする（失敗しても続行）
+	sitemapURLs := fetchSitemapURLs(hc, target.FQDN)
+	backDataURI := ""
+	shownCount := 0
+	if len(sitemapURLs) > 0 {
+		shown, total := limitSitemapURLs(sitemapURLs)
+		shownCount = len(shown)
+		backDataURI, err = renderSitemapJPEG(target.FQDN, sitemapPaths(shown), total)
+		if err != nil {
+			backDataURI = ""
+		}
+	}
+	if backDataURI != "" {
+		detail(fmt.Sprintf("→ サイトマップ %d 件を背面に入れました（全 %d 件）", shownCount, len(sitemapURLs)))
+	} else {
+		detail("→ サイトマップは見つかりませんでした（背面はなしで作ります）")
+	}
+
+	teeURL, err := createTee(hc, cfg.SuzuriBase, cfg.SuzuriKey, dataURI, target.FQDN, backDataURI)
 	if err != nil {
 		fail("SUZURI での T シャツ生成に失敗しました", err)
 	}
