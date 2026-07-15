@@ -69,7 +69,7 @@ func TestTXTNameAndValue(t *testing.T) {
 	if got, want := txtName("suzuri", "example.com"), "suzuri._domainkey.example.com"; got != want {
 		t.Errorf("txtName = %q, want %q", got, want)
 	}
-	if got, want := txtValue("AbC="), "v=DKIM1; k=ed25519; p=AbC="; got != want {
+	if got, want := txtValue("AbC="), "v=DKIP1; k=ed25519; p=AbC="; got != want {
 		t.Errorf("txtValue = %q, want %q", got, want)
 	}
 }
@@ -313,7 +313,7 @@ func TestPutTXT(t *testing.T) {
 	defer srv.Close()
 
 	created, err := putTXT(srv.Client(), srv.URL, "pat", "MU00000001",
-		"suzuri._domainkey.example.com", "v=DKIM1; k=ed25519; p=AbC=")
+		"suzuri._domainkey.example.com", "v=DKIP1; k=ed25519; p=AbC=")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestPutTXT(t *testing.T) {
 	if body["type"] != "TXT" {
 		t.Errorf("type = %q", body["type"])
 	}
-	if body["value"] != "v=DKIM1; k=ed25519; p=AbC=" {
+	if body["value"] != "v=DKIP1; k=ed25519; p=AbC=" {
 		t.Errorf("value = %q", body["value"])
 	}
 }
@@ -559,7 +559,7 @@ func TestEnsureTXTCreated(t *testing.T) {
 	defer srv.Close()
 
 	created, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
-		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=AbC=")
+		"dkip._domainkey.example.com", "v=DKIP1; k=ed25519; p=AbC=")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,13 +579,13 @@ func TestEnsureTXTConflictSameValue(t *testing.T) {
 			}
 			w.Write([]byte(`{"data":[
 				{"fqdn":"www.example.com.","type":"A","value":"203.0.113.1"},
-				{"fqdn":"dkip._domainkey.example.com.","type":"TXT","value":"v=DKIM1; k=ed25519; p=AbC="}]}`))
+				{"fqdn":"dkip._domainkey.example.com.","type":"TXT","value":"v=DKIP1; k=ed25519; p=AbC="}]}`))
 		}
 	}))
 	defer srv.Close()
 
 	created, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
-		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=AbC=")
+		"dkip._domainkey.example.com", "v=DKIP1; k=ed25519; p=AbC=")
 	if err != nil {
 		t.Fatalf("409 with matching value must not be an error: %v", err)
 	}
@@ -600,14 +600,14 @@ func TestEnsureTXTConflictDifferentValue(t *testing.T) {
 		case http.MethodPost:
 			w.WriteHeader(http.StatusConflict)
 		case http.MethodGet:
-			w.Write([]byte(`{"data":[{"fqdn":"dkip._domainkey.example.com.","type":"TXT","value":"v=DKIM1; k=ed25519; p=OldKey="}]}`))
+			w.Write([]byte(`{"data":[{"fqdn":"dkip._domainkey.example.com.","type":"TXT","value":"v=DKIP1; k=ed25519; p=OldKey="}]}`))
 		}
 	}))
 	defer srv.Close()
 
 	// DNS 上の公開鍵と手元の鍵が食い違うと署名が検証できないため、続行してはいけない
 	if _, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
-		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=NewKey="); err == nil {
+		"dkip._domainkey.example.com", "v=DKIP1; k=ed25519; p=NewKey="); err == nil {
 		t.Error("409 with different value must be an error")
 	}
 }
@@ -625,7 +625,7 @@ func TestEnsureTXTConflictRecordNotFound(t *testing.T) {
 
 	// 409 なのに一覧に見つからない＝値の一致を確認できないので、続行してはいけない
 	if _, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
-		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=AbC="); err == nil {
+		"dkip._domainkey.example.com", "v=DKIP1; k=ed25519; p=AbC="); err == nil {
 		t.Error("409 with no matching record must be an error")
 	}
 }

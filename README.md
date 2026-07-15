@@ -47,11 +47,11 @@ dkip example.com
 
 ## 環境変数
 
-| 変数 | 必須 | 説明 |
-| --- | --- | --- |
-| `MUU_PAT` | 必須 | ムームードメインの Personal Access Token（`MUUMUU_PAT` でも可） |
-| `SUZURI_API_KEY` | 必須 | SUZURI API キー（`SUZURI_TOKEN` でも可） |
-| `SELECTOR` | 任意 | DKIM セレクタ。既定 `dkip`。再発行時は `dkip2` などに変える |
+| 変数             | 必須 | 説明                                                            |
+| ---------------- | ---- | --------------------------------------------------------------- |
+| `MUU_PAT`        | 必須 | ムームードメインの Personal Access Token（`MUUMUU_PAT` でも可） |
+| `SUZURI_API_KEY` | 必須 | SUZURI API キー（`SUZURI_TOKEN` でも可）                        |
+| `SELECTOR`       | 任意 | DKIM セレクタ。既定 `dkip`。再発行時は `dkip2` などに変える     |
 
 対象ドメインは環境変数ではなく CLI の第 1 引数で指定します（`dkip example.com`）。
 
@@ -59,7 +59,7 @@ dkip example.com
 
 ```
 名前:  <SELECTOR>._domainkey.<domain>      例: dkip._domainkey.example.com
-値:    v=DKIM1; k=ed25519; p=<base64 公開鍵>
+値:    v=DKIP1; k=ed25519; p=<base64 公開鍵>
 ```
 
 ## 開発

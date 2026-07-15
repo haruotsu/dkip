@@ -126,9 +126,13 @@ func txtName(selector, domain string) string {
 	return selector + "._domainkey." + domain
 }
 
-// txtValue は TXT レコード値 v=DKIM1; k=ed25519; p=<base64公開鍵> を返す。
+// txtValue は TXT レコード値 v=DKIP1; k=ed25519; p=<base64公開鍵> を返す。
+//
+// タグの形式は DKIM (RFC 6376) から借りているが、バージョンは DKIM1 ではなく DKIP1 を名乗る。
+// RFC 6376 3.6.1 は「v= があって DKIM1 以外の値ならレコードを破棄しなければならない」と定めており、
+// DKIP1 にしておけば準拠した DKIM 検証器はこのレコードをメール署名鍵として解釈しない。
 func txtValue(pubB64 string) string {
-	return "v=DKIM1; k=ed25519; p=" + pubB64
+	return "v=DKIP1; k=ed25519; p=" + pubB64
 }
 
 // newNonce は crypto/rand によるランダム 16 進 6 文字を返す。
