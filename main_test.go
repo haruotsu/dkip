@@ -493,6 +493,160 @@ func TestSavePrivateKey(t *testing.T) {
 	}
 }
 
+// --- loadOrCreateKey ---
+
+func TestLoadOrCreateKeyCreatesAndSaves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dns-signed-tee.key")
+	pub, priv, reused, err := loadOrCreateKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused {
+		t.Error("reused = true, want false when key file does not exist")
+	}
+	if !priv.Public().(ed25519.PublicKey).Equal(pub) {
+		t.Error("returned public key does not match private key")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("key file must be saved immediately: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("perm = %o, want 600", perm)
+	}
+}
+
+func TestLoadOrCreateKeyReusesExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dns-signed-tee.key")
+	_, priv1, _, err := loadOrCreateKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub2, priv2, reused, err := loadOrCreateKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reused {
+		t.Error("reused = false, want true when key file exists")
+	}
+	if !priv2.Equal(priv1) {
+		t.Error("second call must return the same private key")
+	}
+	if !priv1.Public().(ed25519.PublicKey).Equal(pub2) {
+		t.Error("public key does not match the original key pair")
+	}
+}
+
+// --- ensureTXT ---
+
+func TestEnsureTXTCreated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	created, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
+		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=AbC=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Error("created = false, want true on 201")
+	}
+}
+
+func TestEnsureTXTConflictSameValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+		case http.MethodGet:
+			if r.URL.Path != "/api/v2/me/domains/MU1/dns-records" {
+				t.Errorf("GET path = %q", r.URL.Path)
+			}
+			w.Write([]byte(`{"data":[
+				{"fqdn":"www.example.com.","type":"A","value":"203.0.113.1"},
+				{"fqdn":"dkip._domainkey.example.com.","type":"TXT","value":"v=DKIM1; k=ed25519; p=AbC="}]}`))
+		}
+	}))
+	defer srv.Close()
+
+	created, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
+		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=AbC=")
+	if err != nil {
+		t.Fatalf("409 with matching value must not be an error: %v", err)
+	}
+	if created {
+		t.Error("created = true, want false on 409")
+	}
+}
+
+func TestEnsureTXTConflictDifferentValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+		case http.MethodGet:
+			w.Write([]byte(`{"data":[{"fqdn":"dkip._domainkey.example.com.","type":"TXT","value":"v=DKIM1; k=ed25519; p=OldKey="}]}`))
+		}
+	}))
+	defer srv.Close()
+
+	// DNS 上の公開鍵と手元の鍵が食い違うと署名が検証できないため、続行してはいけない
+	if _, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
+		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=NewKey="); err == nil {
+		t.Error("409 with different value must be an error")
+	}
+}
+
+func TestEnsureTXTConflictRecordNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+		case http.MethodGet:
+			w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	defer srv.Close()
+
+	// 409 なのに一覧に見つからない＝値の一致を確認できないので、続行してはいけない
+	if _, err := ensureTXT(srv.Client(), srv.URL, "pat", "MU1",
+		"dkip._domainkey.example.com", "v=DKIM1; k=ed25519; p=AbC="); err == nil {
+		t.Error("409 with no matching record must be an error")
+	}
+}
+
+// --- checkASCIIDomain ---
+
+func TestCheckASCIIDomain(t *testing.T) {
+	for _, d := range []string{"example.com", "xn--tckwe-1b4c.jp", "xn--wgv71a119e.jp"} {
+		if err := checkASCIIDomain(d); err != nil {
+			t.Errorf("checkASCIIDomain(%q) = %v, want nil (punycode must be accepted)", d, err)
+		}
+	}
+	for _, d := range []string{"日本語.jp", "テスト.com", "ドメイン.日本"} {
+		if err := checkASCIIDomain(d); err == nil {
+			t.Errorf("checkASCIIDomain(%q) = nil, want error", d)
+		} else if !strings.Contains(err.Error(), "punycode") {
+			t.Errorf("error should suggest punycode form: %v", err)
+		}
+	}
+}
+
+func TestLoadConfigRejectsNonASCIIDomain(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("MUU_PAT", "pat")
+	t.Setenv("SUZURI_API_KEY", "key")
+
+	if _, err := loadConfig([]string{"日本語.jp"}); err == nil {
+		t.Error("expected error for non-ASCII domain arg")
+	}
+	if _, err := loadConfig([]string{"xn--wgv71a119e.jp"}); err != nil {
+		t.Errorf("punycode domain arg must be accepted: %v", err)
+	}
+}
+
 func TestLoadConfigDomainFromArg(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("MUU_PAT", "pat")

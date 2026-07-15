@@ -72,6 +72,9 @@ func loadConfig(args []string) (config, error) {
 	if len(args) > 0 && args[0] != "" {
 		cfg.Domain = args[0]
 	}
+	if err := checkASCIIDomain(cfg.Domain); err != nil {
+		return cfg, err
+	}
 	if cfg.MuuPAT == "" {
 		return cfg, errors.New("環境変数 MUU_PAT（ムームー Personal Access Token）を設定してください")
 	}
@@ -79,6 +82,17 @@ func loadConfig(args []string) (config, error) {
 		return cfg, errors.New("環境変数 SUZURI_API_KEY（SUZURI API キー）を設定してください")
 	}
 	return cfg, nil
+}
+
+// checkASCIIDomain はドメインが ASCII のみか検査する。日本語（Unicode）ドメインは
+// 未対応のため、punycode 形式（xn-- で始まる ASCII 表記）での指定を求める。
+func checkASCIIDomain(domain string) error {
+	for _, r := range domain {
+		if r > 127 {
+			return fmt.Errorf("日本語（Unicode）ドメイン %q には対応していません。punycode 形式（xn-- で始まる表記）で指定してください", domain)
+		}
+	}
+	return nil
 }
 
 // ---- 署名まわり ----
@@ -263,6 +277,57 @@ func putTXT(hc *http.Client, base, token, domainID, name, value string) (created
 	}
 }
 
+// getTXTValue は DNS レコード一覧（GET /api/v2/me/domains/{id}/dns-records）から
+// name（末尾ドットの有無は問わない）に一致する TXT レコードの値を返す。無ければ空文字。
+func getTXTValue(hc *http.Client, base, token, domainID, name string) (string, error) {
+	status, body, err := doJSON(hc, http.MethodGet, base+"/api/v2/me/domains/"+domainID+"/dns-records", token, nil)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("DNS レコード一覧の取得に失敗しました (HTTP %d): %s", status, body)
+	}
+	var res struct {
+		Data []struct {
+			FQDN  string `json:"fqdn"`
+			Type  string `json:"type"`
+			Value string `json:"value"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		return "", err
+	}
+	want := strings.TrimSuffix(name, ".")
+	for _, rec := range res.Data {
+		if rec.Type == "TXT" && strings.TrimSuffix(rec.FQDN, ".") == want {
+			return rec.Value, nil
+		}
+	}
+	return "", nil
+}
+
+// ensureTXT は TXT レコードを登録する。既存（409）の場合は DNS 上の値と value を照合し、
+// 一致すればそのまま継続できる。不一致なら DNS 上の古い公開鍵では今回の署名を検証できないため、
+// 続行せずエラーを返す。
+func ensureTXT(hc *http.Client, base, token, domainID, name, value string) (created bool, err error) {
+	created, err = putTXT(hc, base, token, domainID, name, value)
+	if err != nil || created {
+		return created, err
+	}
+	existing, err := getTXTValue(hc, base, token, domainID, name)
+	if err != nil {
+		return false, err
+	}
+	if existing == value {
+		return false, nil
+	}
+	return false, fmt.Errorf(
+		"TXT レコード %s は既に別の公開鍵で登録されています。このまま発行すると QR の署名が検証に失敗します。\n"+
+			"   DNS 上の値: %s\n   今回の値:   %s\n"+
+			"   セレクタを変えて再実行する（例: SELECTOR=dkip2）か、古い TXT レコードを削除してください",
+		name, existing, value)
+}
+
 // ---- SUZURI API ----
 
 // createTee は JPEG データ URI を素材として T シャツを生成し、商品ページ URL を返す。
@@ -427,6 +492,47 @@ func savePrivateKey(path string, priv ed25519.PrivateKey) error {
 	return os.WriteFile(path, pemBytes, 0o600)
 }
 
+// loadPrivateKey は PKCS#8 PEM 形式の Ed25519 秘密鍵を読み込む。
+func loadPrivateKey(path string) (ed25519.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("%s は PEM 形式ではありません", path)
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	priv, ok := parsed.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("%s は Ed25519 秘密鍵ではありません", path)
+	}
+	return priv, nil
+}
+
+// loadOrCreateKey は path に鍵ファイルがあればそれを再利用し、無ければ新規生成して即保存する。
+// 鍵を再利用しないと、DNS に登録済みの公開鍵と食い違って署名が検証できなくなる。
+func loadOrCreateKey(path string) (ed25519.PublicKey, ed25519.PrivateKey, bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		priv, err := loadPrivateKey(path)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return priv.Public().(ed25519.PublicKey), priv, true, nil
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if err := savePrivateKey(path, priv); err != nil {
+		return nil, nil, false, err
+	}
+	return pub, priv, false, nil
+}
+
 // ---- 実況ログ ----
 
 func step(emoji, msg string) {
@@ -473,12 +579,16 @@ func main() {
 	}
 	hc := &http.Client{Timeout: 30 * time.Second}
 
-	step("🔑", "鍵ペアを生成中...")
-	pub, priv, err := ed25519.GenerateKey(nil)
+	step("🔑", "鍵ペアを準備中...")
+	pub, priv, reused, err := loadOrCreateKey(keyFilePath)
 	if err != nil {
-		fail("鍵ペアの生成に失敗しました", err)
+		fail("鍵ペアの準備に失敗しました", err)
 	}
-	detail("done (Ed25519)")
+	if reused {
+		detail(fmt.Sprintf("→ 既存の秘密鍵 ./%s を再利用します", keyFilePath))
+	} else {
+		detail(fmt.Sprintf("→ 生成しました (Ed25519)。秘密鍵を ./%s に保存しました（大切に保管してください）", keyFilePath))
+	}
 
 	step("🌐", "あなたのドメインを確認中...")
 	domains, err := listDomains(hc, cfg.MuumuuBase, cfg.MuuPAT)
@@ -488,6 +598,9 @@ func main() {
 	target, err := chooseDomain(domains, cfg.Domain)
 	if err != nil {
 		fail("ドメインの選択に失敗しました", err)
+	}
+	if err := checkASCIIDomain(target.FQDN); err != nil {
+		fail("このドメインには対応していません", err)
 	}
 	year, err := getDomainYear(hc, cfg.MuumuuBase, cfg.MuuPAT, target.ID)
 	if err != nil {
@@ -512,14 +625,14 @@ func main() {
 	step("📡", "公開鍵を DNS に刻んでいます...")
 	name := txtName(cfg.Selector, target.FQDN)
 	detail("TXT  " + name)
-	created, err := putTXT(hc, cfg.MuumuuBase, cfg.MuuPAT, target.ID, name, txtValue(encodePublicKey(pub)))
+	created, err := ensureTXT(hc, cfg.MuumuuBase, cfg.MuuPAT, target.ID, name, txtValue(encodePublicKey(pub)))
 	if err != nil {
 		fail("TXT レコードの登録に失敗しました", err)
 	}
 	if created {
 		detail("→ 世界中から検証できるようになりました ✅")
 	} else {
-		detail("→ 既に登録済みです（セレクタを変える場合は SELECTOR=dkip2 などで再実行してください）")
+		detail("→ 既に同じ公開鍵で登録済みです（このまま続行します）")
 	}
 
 	step("👕", "T シャツを生成中...")
@@ -540,9 +653,4 @@ func main() {
 	}
 
 	step("🔗", "検証 URL: "+buildVerifyURL(cfg.VerifyBase, target.FQDN, year, issuedAt, nonce, sig, teeURL))
-
-	if err := savePrivateKey(keyFilePath, priv); err != nil {
-		fail("秘密鍵の保存に失敗しました", err)
-	}
-	step("🔐", fmt.Sprintf("秘密鍵を ./%s に保存しました（大切に保管してください。これを無くすと同じ鍵で再発行できません）", keyFilePath))
 }
